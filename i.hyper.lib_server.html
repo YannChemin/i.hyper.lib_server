@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>i.hyper.lib_server - GRASS GIS manual</title>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h2>NAME</h2>
+
+<p><em>i.hyper.lib_server</em> - Build, serve and query a resident nearest-neighbour index over an OpenSpecLib spectral library.</p>
+
+<h2>SYNOPSIS</h2>
+
+<p><b>i.hyper.lib_server</b> <b>operation</b>=<em>build|derive|serve|status|query</em> [<b>index</b>=<em>dir</em>] [<b>library</b>=<em>dir</em>] [<b>step</b>=<em>value</em>] [<b>lo</b>=<em>value</em>] [<b>hi</b>=<em>value</em>] [<b>min_coverage</b>=<em>value</em>] [<b>batch</b>=<em>value</em>] [<b>metric</b>=<em>string</em>[,<em>string</em>,...]] [<b>input</b>=<em>file</em>] [<b>output</b>=<em>file</em>] [<b>k</b>=<em>value</em>] [<b>source</b>=<em>string</em>[,<em>string</em>,...]] [<b>category</b>=<em>string</em>[,<em>string</em>,...]] [<b>min_overlap</b>=<em>value</em>] [<b>min_overlap_bands</b>=<em>value</em>] [<b>format</b>=<em>plain|csv|json</em>] [<b>host</b>=<em>string</em>] [<b>port</b>=<em>value</em>] [<b>url</b>=<em>string</em>] [<b>-s</b>]</p>
+
+<h2>DESCRIPTION</h2>
+
+<p><em>i.hyper.lib_server</em> is the search end of the <code>i.hyper.lib_*</code> family. The harvesters (<em>i.hyper.lib_ecosis</em>, <em>i.hyper.lib_gsti</em>, <em>i.hyper.lib_ossl</em>, <em>i.hyper.lib_relab</em>, <em>i.hyper.lib_usgs</em>) fill one shared store; <code>openspeclib</code> combines that store into a validated library of per-source Parquet files; this module turns that library into a resident index and answers <em>which reference spectra are closest to this measured one</em>.</p>
+
+<p>The question it answers is the same one <em>i.hyper.speclookup</em> asks of the raw store, but at a different scale and with a different guarantee. A linear scan over the store re-interpolates every candidate for every query &mdash; about 9 microseconds each, so seconds per query over a few hundred thousand spectra. Here every library spectrum is resampled <b>once</b> onto a canonical grid, L2-normalised, and written as a <code>float32</code> memory map, so a spectral angle against the whole library is a single matrix-vector product: tens of milliseconds, exactly, with no approximation anywhere.</p>
+
+<h3>Why an exact search</h3>
+
+<p>No approximate index is used, and that is a measurement rather than a preference. At this size a full GEMV takes 10-20 ms, while a space-partitioning tree degenerates to a linear scan above roughly 20 dimensions, so a tree would be both slower and approximate. The matrices are memory-mapped, so start-up is immediate and several processes share the same physical pages.</p>
+
+<h3>Operations</h3>
+
+<table border="1">
+<tr><th>operation</th><th>What it does</th></tr>
+<tr><td><code>build</code></td><td>Resamples every spectrum of <b>library</b> onto the canonical grid and writes <code>library.f32</code>, <code>metadata.json</code> and <code>index.json</code> into <b>index</b></td></tr>
+<tr><td><code>derive</code></td><td>Writes the three matrices each <b>metric</b> family scores against, beside the index</td></tr>
+<tr><td><code>serve</code></td><td>Runs the local HTTP service over <b>index</b> in the foreground, until interrupted</td></tr>
+<tr><td><code>status</code></td><td>Reports what an index holds, or what a running service answers (<b>-s</b>)</td></tr>
+<tr><td><code>query</code></td><td>Returns the <b>k</b> closest library spectra to the spectrum in <b>input</b></td></tr>
+</table>
+
+<p><code>build</code> then <code>derive</code> is the normal sequence: the index alone answers nothing until its matrices exist, and <code>status</code> lists the metrics an index can actually serve.</p>
+
+<h3>Metrics</h3>
+
+<p>Four, in two families. <code>sam</code> and <code>cosine</code> compare reflectance as stored. <code>cr_sam</code> compares continuum-removed <b>band depth</b> and <code>gd1</code> the first derivative, and for those the library is scored in the same derived form, from its own matrix set and its own support mask.</p>
+
+<p>This is why each family needs its own matrices rather than sharing one set. A query transformed on its own and compared against untransformed reflectance is not a comparison: it returns a number shaped like an angle, ordered by nothing in particular. A metric whose matrix set an index does not carry is therefore <b>refused</b>, with the command that would build it, rather than quietly answered from the reflectance matrices.</p>
+
+<p><code>cr_sam</code> returns band depth, <code>1 - R/C</code>, not the ratio. Every continuum-removed spectrum is a vector of ones with shallow dips in it, so any two of them are nearly parallel and the angle between them is dominated by the constant they share rather than by the absorptions that distinguish them. Subtracting the continuum leaves only the absorptions, which is the quantity mineral identification rests on.</p>
+
+<h3>Spectral gaps, on both sides</h3>
+
+<p>A wavelength axis is rarely contiguous: drone and airborne products routinely drop both water-vapour windows, and field spectrometer records often have the same regions removed as noise. Resampling such an axis with one interpolation over its full span draws a straight line across each gap and so claims support the instrument never measured.</p>
+
+<p>Both the query and the library are projected gap by gap, so "overlap" counts bands that were really measured on both sides. Measured on one C2RD drone spectrum (HySpex VS620, 408 bands, 411.4-2449.7 nm, gaps at 1329.0-1482.6 nm and 1784.5-1984.0 nm) against a 251 753-spectrum index, bridging fabricates 36 of the 203 in-range grid points, 17.7 %, inflates every angle in the top 10 by 2.0-2.6 degrees, and reorders 3 of them.</p>
+
+<p>A candidate sharing too few bands with the query is <b>rejected rather than scored</b>: an angle measured over a handful of bands is not a measurement. Two thresholds apply and the stricter decides. <b>min_overlap</b> is a fraction of what the query itself covers, so on its own it loosens exactly where the query is gappiest and the guarantee is needed most; <b>min_overlap_bands</b> is an absolute floor in grid points.</p>
+
+<h3>Querying without a server</h3>
+
+<p><b>operation</b>=<em>query</em> opens the index in the module's own process by default, which needs no service running: a module already holding the matrices has no reason to serialise a spectrum to itself. Pass <b>-s</b>, or a <b>url</b>, to send the query to a service instead &mdash; worth it when many queries follow one another, since the service keeps the matrices mapped between them.</p>
+
+<h3>Progress</h3>
+
+<p>Long passes report through <code>gs.percent()</code>, as a real fraction of the spectra read, which the <code>libmmgrass.so</code> shim forwards to MetaMonitor (&lt;https://github.com/YannChemin/MetaMonitor&gt;). The module writes no MetaMonitor slot of its own; that would report the same work twice.</p>
+
+<h2>NOTES</h2>
+
+<p>The index is built from an <b>OpenSpecLib</b> library, not from the shared harvest store directly, because the unit conversions are openspeclib's own. <code>openspeclib</code> must therefore be importable; if it is not, the module says so and stops rather than guessing, since guessing a wavenumber axis is a silent factor-of-1000 error.</p>
+
+<p>The canonical grid defaults to 350-2500 nm at 10 nm, which is the reflective range. Library spectra outside it &mdash; OSSL's mid-infrared absorbance, for one &mdash; are skipped, and <code>index.json</code> records how many.</p>
+
+<p><code>library.f32</code> is <code>n_spectra x n_bands x 4</code> bytes and each metric family adds three matrices of the same size, so a 360 000-spectrum index on the default grid is roughly 310 MB for the reflectance set and the same again per transformed metric. They are mapped on first use, not at start-up.</p>
+
+<h2>EXAMPLES</h2>
+
+<h3>Build an index and the matrices it answers from</h3>
+
+<div class="code"><pre>
+i.hyper.lib_server operation=build \
+    library=$HOME/grassdata/openspeclib \
+    index=$HOME/grassdata/specserve \
+    step=10 lo=350 hi=2500 min_coverage=0.30
+
+i.hyper.lib_server operation=derive \
+    index=$HOME/grassdata/specserve metric=sam,cr_sam,gd1
+</pre></div>
+
+<h3>Ask what an index holds</h3>
+
+<div class="code"><pre>
+i.hyper.lib_server operation=status index=$HOME/grassdata/specserve
+</pre></div>
+
+<h3>Identify a measured spectrum</h3>
+
+<div class="code"><pre>
+i.hyper.lib_server operation=query \
+    input=leaf.csv k=10 metric=sam \
+    source=ecosis,gsti category=vegetation
+</pre></div>
+
+<p>With a mineral target, the continuum-removed metric is usually the one that discriminates, and a hard floor on the overlap keeps a short SWIR window from matching on three bands:</p>
+
+<div class="code"><pre>
+i.hyper.lib_server operation=query \
+    input=outcrop.csv k=5 metric=cr_sam \
+    category=mineral min_overlap=0.6 min_overlap_bands=40 \
+    format=csv output=matches.csv
+</pre></div>
+
+<h3>Sample a cube and identify what is there</h3>
+
+<p><code>r3.what</code> reads only the voxels asked for, so a point spectrum comes out of a hyperspectral cube in well under a second:</p>
+
+<div class="code"><pre>
+r3.what input=mosaic_final coordinates=412340,4805210 -n \
+    | tr &#x27; &#x27; &#x27;\n&#x27; &gt; pixel.csv
+i.hyper.lib_server operation=query input=pixel.csv k=10 metric=cr_sam
+</pre></div>
+
+<h3>Run the service, then query it</h3>
+
+<div class="code"><pre>
+i.hyper.lib_server operation=serve index=$HOME/grassdata/specserve port=8977 &amp;
+i.hyper.lib_server operation=status -s port=8977
+i.hyper.lib_server operation=query -s input=leaf.csv k=10
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<p><em><a href="i.hyper.lib_ecosis.html">i.hyper.lib_ecosis</a></em>, <em><a href="i.hyper.lib_gsti.html">i.hyper.lib_gsti</a></em>, <em><a href="i.hyper.lib_ossl.html">i.hyper.lib_ossl</a></em>, <em><a href="i.hyper.lib_relab.html">i.hyper.lib_relab</a></em>, <em><a href="i.hyper.lib_usgs.html">i.hyper.lib_usgs</a></em>, <em><a href="i.hyper.speclookup.html">i.hyper.speclookup</a></em>, <em><a href="i.hyper.specresamp.html">i.hyper.specresamp</a></em>, <em><a href="r3.what.html">r3.what</a></em></p>
+
+<h2>AUTHOR</h2>
+
+<p>Spectral Feature Extraction and Interpretation Engine</p>
+
+</body>
+</html>
